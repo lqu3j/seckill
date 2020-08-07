@@ -2,26 +2,27 @@ package com.github.lyrric.service;
 
 import com.github.lyrric.conf.Config;
 import com.github.lyrric.model.BusinessException;
-import com.github.lyrric.model.VaccineDetail;
+import com.github.lyrric.model.SubDate;
+import com.github.lyrric.model.SubDateTime;
 import com.github.lyrric.model.VaccineList;
+import com.github.lyrric.ui.MainFrame;
+import org.apache.commons.logging.Log;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
+import javax.lang.model.element.VariableElement;
+import javax.swing.*;
 import java.io.IOException;
-import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.Comparator;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.List;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
 
 /**
  * Created on 2020-07-22.
@@ -32,7 +33,9 @@ public class SecKillService {
 
     private HttpService httpService;
 
-    private ExecutorService executorService = Executors.newFixedThreadPool(10);
+    private final Logger logger = LogManager.getLogger(SecKillService.class);
+
+    private ExecutorService service = Executors.newFixedThreadPool(50);
 
     public SecKillService() {
         httpService = new HttpService();
@@ -40,75 +43,106 @@ public class SecKillService {
 
     /**
      * 多线程秒杀开启
-     * @param vcode
      */
     @SuppressWarnings("AlibabaAvoidManuallyCreateThread")
-    public boolean startSecKill(String vcode, Integer id) {
-        AtomicBoolean success = new AtomicBoolean(false);
-        Runnable task = ()->{
-            try {
-                //1.获取疫苗信息
-                VaccineDetail vaccineDetail = null;
-                do {
-                    try {
-                        vaccineDetail = httpService.getVaccineDetail(id);
-                    }catch (Exception e){
-                        System.out.println(e.getMessage());
-                    }
-                }while (vaccineDetail == null);
-                //2.加密time串
-                Long time = vaccineDetail.getTime();
-                String str = time + "fuckhacker10000times";
-                MessageDigest md5 = MessageDigest.getInstance("md5");
-                String sign =  new BigInteger(1, md5.digest(str.getBytes(StandardCharsets.UTF_8))).toString(16);
-                List<VaccineDetail.Day> days = vaccineDetail.getDays();
-                //3.并发请求秒杀，此请求受验证码影响，最多只会成功一次
-                days.forEach(day -> {
-                    new Thread(()->{
-                        try {
-                            httpService.secKill(id.toString(), "1", Config.memberId.toString(), formatDate(day.getDay()), sign, vcode);
-                            success.set(true);
-                            System.out.println("预约成功！");
-                        } catch (BusinessException e) {
-                            e.printStackTrace();
-                            System.out.println("失败:"+e.getErrMsg());
-                        } catch (Exception e) {
-                            e.printStackTrace();
-                        }
-                    }).start();
-                });
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        };
-        for (int i = 0; i < 10; i++) {
-            executorService.submit(task);
+    public void startSecKill(Integer vaccineId, String startDateStr, MainFrame mainFrame) throws ParseException, InterruptedException {
+        long startDate = convertDateToInt(startDateStr);
+        long now = System.currentTimeMillis();
+        if(now + 1000 < startDate){
+            logger.info("距离开始时间大于1秒，等待中......");
+            Thread.sleep(startDate-now-1000);
         }
-        executorService.shutdown();
+        logger.info("###########开始秒杀###########");
+        AtomicBoolean success = new AtomicBoolean(false);
+        AtomicReference<String> orderId = new AtomicReference<>(null);
+        Runnable task = ()-> {
+            do {
+                try {
+                    List<SubDate> skSubDays = null;
+                    //1.直接秒杀、获取秒杀资格
+                    orderId.set(httpService.secKill(vaccineId.toString(), "1", Config.memberId.toString(), Config.idCard));
+                    do {
+                        try {
+                            //2.秒杀成功后，获取接种日期
+                            skSubDays = httpService.getSkSubDays(vaccineId.toString(), orderId.get());
+                        } catch (BusinessException e) {
+                            logger.info("获取接种日期，失败: {}",e.getErrMsg());
+                        } catch (IOException e) {
+                            logger.warn("获取接种日期，未知异常：", e.getCause());
+                        }
+                    } while (skSubDays == null);
+
+                    for (SubDate day : skSubDays) {
+                        Runnable getTimeTask = () -> {
+                            try {
+                                //3.根据接种日期，获取接种时间段
+                                List<SubDateTime> skSubDayTime = httpService.getSkSubDayTime(vaccineId.toString(), orderId.toString(), day.getDay());
+                                for (SubDateTime time : skSubDayTime) {
+                                    //4.提交接种时间
+                                    Runnable subDayTimeTask = () -> {
+                                        try {
+                                            httpService.subDayTime(vaccineId.toString(), orderId.get(), day.getDay(), time.getWid());
+                                            success.set(true);
+                                        } catch (BusinessException e) {
+                                            logger.info("提交接种时间，失败: {}",e.getErrMsg());
+                                        } catch (IOException e) {
+                                            logger.warn("提交接种时间，未知异常：", e.getCause());
+                                        }
+                                    };
+                                    service.submit(subDayTimeTask);
+                                }
+                            } catch (BusinessException e) {
+                                logger.info("获取接种时间段，失败: {}",e.getErrMsg());
+                            } catch (IOException e) {
+                                logger.warn("获取接种时间段，未知异常：", e.getCause());
+                            }
+                        };
+                        service.submit(getTimeTask);
+                    }
+                } catch (BusinessException e) {
+                    logger.info("抢购失败: {}",e.getErrMsg());
+                    //如果离开始时间30秒后，都没有抢到，则判定失败
+                    if(System.currentTimeMillis() > startDate+1000*30){
+                        return;
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    logger.warn("未知异常：");
+                }
+            } while (orderId.get() == null);
+        };
+
+        for (int i = 0; i < 20; i++) {
+            service.submit(task);
+        }
+
+        service.shutdown();
         //等待线程结束
         try {
-            executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
+            service.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
+            if(success.get()){
+                mainFrame.appendMsg("抢购成功，请登录约苗小程序查看");
+                logger.info("抢购成功，请登录约苗小程序查看");
+            }else{
+                mainFrame.appendMsg("抢购失败");
+            }
         } catch (InterruptedException e) {
-            e.printStackTrace();
+            mainFrame.appendMsg("未知异常");
+            logger.info("抢购失败:",e.getCause());
         }
-        return success.get();
+
     }
-
-
-    public String getCapture() throws IOException, BusinessException {
-        return httpService.getCapture();
-    }
-
     public List<VaccineList> getVaccines() throws IOException, BusinessException {
         return httpService.getVaccineList();
     }
     /**
-     * 将19981231变成1998-12-31
-     * @param date
+     *  将时间字符串转换为时间戳
+     * @param dateStr yyyy-mm-dd格式
      * @return
      */
-    public String formatDate(String date){
-        return date.substring(0,3)+"-"+date.substring(3,5)+"-"+date.substring(6,8);
+    public long convertDateToInt(String dateStr) throws ParseException {
+        DateFormat format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        Date date = format.parse(dateStr);
+        return date.getTime();
     }
-
 }

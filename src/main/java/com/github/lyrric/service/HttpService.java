@@ -32,6 +32,7 @@ public class HttpService {
 
     private final Logger logger = LogManager.getLogger(HttpService.class);
 
+
     /***
      * 获取秒杀资格
      * @param seckillId 疫苗ID
@@ -60,8 +61,8 @@ public class HttpService {
     public List<SubDate> getSkSubDays(String vaccineId, String orderId) throws IOException, BusinessException {
         String path = baseUrl+"/seckill/seckill/subscribeDays.do";
         Map<String, String> params = new HashMap<>();
-        params.put("seckillId", vaccineId);
-        params.put("vaccineIndex", orderId);
+        params.put("id", vaccineId);
+        params.put("sid", orderId);
         String json =  get(path, params);
         logger.info("日期格式:{}", json);
         return JSONObject.parseArray(json).toJavaList(SubDate.class);
